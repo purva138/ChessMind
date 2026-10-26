@@ -1,0 +1,4 @@
+pygame
+chess
+numpy
+pytest
