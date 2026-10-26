@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional, Tuple
 
 import chess
 import pygame
 
+from chessmind.ai.engine import choose_move
 from chessmind.game.game_state import GameState
 from chessmind.game.move_input import MoveInput
 from chessmind.ui import theme
@@ -23,6 +25,13 @@ class App:
         pygame.display.set_caption("ChessMind AI")
         self.screen = pygame.display.set_mode((theme.WINDOW_WIDTH, theme.WINDOW_HEIGHT))
         self.clock = pygame.time.Clock()
+
+        # Run AI calculations outside the Pygame event loop.
+        self.ai_executor = ThreadPoolExecutor(max_workers=1)
+        self.ai_future: Optional[Future] = None
+        self.ai_position_fen: Optional[str] = None
+        self.ai_error: Optional[str] = None
+
         self.board_view = BoardView(theme.SQUARE_SIZE, (0, 0))
         self.dialog = PromotionDialog(theme.BOARD_SIZE, theme.SQUARE_SIZE)
         self.title_font = pygame.font.SysFont("arial", 28, bold=True)
@@ -37,10 +46,86 @@ class App:
         self.use_game(GameState())
 
     def use_game(self, game: GameState) -> None:
-        """Attach a game (and a fresh input handler) to the window."""
+        """Attach a game and restrict human input to White."""
         self.game = game
-        self.input = MoveInput(game)
+
+        self.input = MoveInput(
+            game,
+            controlled_colors=(chess.WHITE,),
+        )
+
         self.drag_square = None
+
+    def update_ai(self) -> None:
+        """Schedule and apply AI moves without blocking Pygame."""
+
+        # Do not calculate a move after the game has ended.
+        if self.game.is_game_over:
+            return
+
+        # The AI controls Black only.
+        if self.game.turn != chess.BLACK:
+            return
+
+        # Do not start another calculation if an error occurred.
+        if self.ai_error is not None:
+            return
+
+        # Start a calculation if one is not already running.
+        if self.ai_future is None:
+            # Give the worker its own board copy. The AI's search must
+            # not modify the board currently used by the GUI.
+            board_snapshot = self.game.board.copy(stack=True)
+
+            self.ai_position_fen = board_snapshot.fen()
+
+            self.ai_future = self.ai_executor.submit(
+                choose_move,
+                board_snapshot,
+                chess.BLACK,
+                2,
+            )
+
+        # Wait for the background calculation without blocking the UI.
+        if not self.ai_future.done():
+            return
+
+        future = self.ai_future
+        expected_fen = self.ai_position_fen
+
+        # Clear the pending task before handling its result.
+        self.ai_future = None
+        self.ai_position_fen = None
+
+        try:
+            move = future.result()
+        except Exception as exc:
+            self.ai_error = str(exc)
+            print(f"ChessMind AI error: {exc}")
+            return
+
+        # A reset or undo may have changed the game while the AI was
+        # calculating. Never apply a move for an outdated position.
+        if self.game.board.fen() != expected_fen:
+            return
+
+        # Recheck the game state and turn before applying the move.
+        if self.game.is_game_over:
+            return
+
+        if self.game.turn != chess.BLACK:
+            return
+
+        if move is None:
+            return
+
+        # Validate the AI's move against the actual game board.
+        if move not in self.game.board.legal_moves:
+            self.ai_error = f"AI returned an illegal move: {move.uci()}"
+            print(f"ChessMind AI error: {self.ai_error}")
+            return
+
+        self.game.make_move(move)
 
     # ---- main loop -----------------------------------------------------
 
@@ -59,6 +144,9 @@ class App:
                     self.on_mouse_down(event.pos)
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                     self.on_mouse_up(event.pos)
+            # Update the AI without blocking the Pygame event loop.
+            self.update_ai()
+
             self.draw()
             pygame.display.flip()
             self.clock.tick(theme.FPS)
@@ -73,12 +161,37 @@ class App:
             self.undo()
 
     def new_game(self) -> None:
+        """Reset the game and invalidate any pending AI result."""
+
+        if self.ai_future is not None:
+            self.ai_future.cancel()
+
+        self.ai_future = None
+        self.ai_position_fen = None
+        self.ai_error = None
+
         self.game.reset()
         self.input.clear()
         self.drag_square = None
 
     def undo(self) -> None:
-        self.game.undo()
+        """Undo the most recent human move and AI reply."""
+
+        # Invalidate any AI calculation already in progress.
+        if self.ai_future is not None:
+            self.ai_future.cancel()
+
+        self.ai_future = None
+        self.ai_position_fen = None
+        self.ai_error = None
+
+        # Undo the most recent move.
+        if self.game.undo():
+            # If that move was Black's, it is now Black's turn again.
+            # Undo the corresponding White move too.
+            if self.game.turn == chess.BLACK:
+                self.game.undo()
+
         self.input.clear()
         self.drag_square = None
 
@@ -162,10 +275,10 @@ class App:
             y = self._text(line, self.small_font, theme.TEXT_COLOR, x, y)
 
         help_lines = [
-            "Two-player mode (AI comes next)",
-            "Click or drag a piece to move",
-            "N new game   U undo   ESC quit",
-        ]
+        "Play as White against the AI",
+        "Click or drag a piece to move",
+        "N new game   U undo   ESC quit",
+    ]
         y = theme.WINDOW_HEIGHT - 25 * len(help_lines) - 10
         for line in help_lines:
             y = self._text(line, self.small_font, theme.MUTED_TEXT, x, y)
